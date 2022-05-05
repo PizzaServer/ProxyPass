@@ -3,7 +3,9 @@ package com.nukkitx.proxypass.network.bedrock.util;
 import com.fasterxml.jackson.annotation.JsonInclude;
 import com.nukkitx.nbt.NBTOutputStream;
 import com.nukkitx.nbt.NbtMap;
+import com.nukkitx.nbt.NbtType;
 import com.nukkitx.nbt.NbtUtils;
+import com.nukkitx.nbt.util.stream.LittleEndianDataOutputStream;
 import com.nukkitx.protocol.bedrock.data.inventory.*;
 import com.nukkitx.protocol.bedrock.packet.CraftingDataPacket;
 import com.nukkitx.proxypass.ProxyPass;
@@ -12,16 +14,27 @@ import lombok.Getter;
 import lombok.NoArgsConstructor;
 import lombok.Value;
 import lombok.experimental.UtilityClass;
+import lombok.extern.log4j.Log4j2;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.util.*;
 
+@Log4j2
 @UtilityClass
 public class RecipeUtils {
     private static final char[] SHAPE_CHARS = {'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J'};
 
     public static void writeRecipes(CraftingDataPacket packet, ProxyPass proxy) {
+        Object object = proxy.loadGzipNBT("block_palette.nbt");
+        List<NbtMap> paletteTags = null;
+        if (object instanceof NbtMap) {
+            NbtMap map = (NbtMap) object;
+            paletteTags = map.getList("blocks", NbtType.COMPOUND);
+        } else {
+            log.warn("Failed to load block palette for recipes. Output will contain not contain block states!");
+        }
+
         List<CraftingDataEntry> entries = new ArrayList<>();
         List<PotionMixDataEntry> potions = new ArrayList<>();
         List<ContainerMixDataEntry> containers = new ArrayList<>();
@@ -41,7 +54,7 @@ public class RecipeUtils {
             if (type == CraftingDataType.SHAPED || type == CraftingDataType.SHAPELESS || type == CraftingDataType.SHAPELESS_CHEMISTRY || type == CraftingDataType.SHULKER_BOX || type == CraftingDataType.SHAPED_CHEMISTRY) {
                 entry.id = craftingData.getRecipeId();
                 entry.priority = craftingData.getPriority();
-                entry.output = writeItemArray(craftingData.getOutputs().toArray(new ItemData[0]), true);
+                entry.output = writeItemArray(craftingData.getOutputs().toArray(new ItemData[0]), true, paletteTags);
             }
             if (type == CraftingDataType.SHAPED || type == CraftingDataType.SHAPED_CHEMISTRY) {
 
@@ -56,7 +69,7 @@ public class RecipeUtils {
                     int index = height * craftingData.getWidth();
                     for (int width = 0; width < craftingData.getWidth(); width++) {
                         int slot = index + width;
-                        Item item = itemFromNetwork(inputs.get(slot), false);
+                        Item item = itemFromNetwork(inputs.get(slot), false, paletteTags);
 
                         if (item == Item.EMPTY) {
                             continue;
@@ -85,15 +98,15 @@ public class RecipeUtils {
                 entry.input = itemMap;
             }
             if (type == CraftingDataType.SHAPELESS || type == CraftingDataType.SHAPELESS_CHEMISTRY || type == CraftingDataType.SHULKER_BOX) {
-                entry.input = writeItemArray(craftingData.getInputs().toArray(new ItemData[0]), false);
+                entry.input = writeItemArray(craftingData.getInputs().toArray(new ItemData[0]), false, paletteTags);
             }
 
             if (type == CraftingDataType.FURNACE || type == CraftingDataType.FURNACE_DATA) {
                 Integer damage = craftingData.getInputDamage();
                 if (damage == 0x7fff) damage = -1;
                 if (damage == 0) damage = null;
-                entry.input = new Item(craftingData.getInputId(), ProxyPass.legacyIdMap.get(craftingData.getInputId()), damage, null, null);
-                entry.output = itemFromNetwork(craftingData.getOutputs().get(0), true);
+                entry.input = new Item(craftingData.getInputId(), ProxyPass.legacyIdMap.get(craftingData.getInputId()), damage, null, null, null);
+                entry.output = itemFromNetwork(craftingData.getOutputs().get(0), true, paletteTags);
             }
             entries.add(entry);
         }
@@ -121,10 +134,10 @@ public class RecipeUtils {
         proxy.saveJson("recipes.json", recipes);
     }
 
-    private static List<Item> writeItemArray(ItemData[] inputs, boolean output) {
+    private static List<Item> writeItemArray(ItemData[] inputs, boolean output, List<NbtMap> paletteTags) {
         List<Item> outputs = new ArrayList<>();
         for (ItemData input : inputs) {
-            Item item = itemFromNetwork(input, output);
+            Item item = itemFromNetwork(input, output, paletteTags);
             if (item != Item.EMPTY) {
                 outputs.add(item);
             }
@@ -146,7 +159,7 @@ public class RecipeUtils {
         }
     }
 
-    private static Item itemFromNetwork(ItemData data, boolean output) {
+    private static Item itemFromNetwork(ItemData data, boolean output, List<NbtMap> paletteTags) {
         int id = data.getId();
         String identifier = ProxyPass.legacyIdMap.get(id);
         Integer damage = (int) data.getDamage();
@@ -159,7 +172,22 @@ public class RecipeUtils {
         if (damage == 0 || (damage == -1 && output)) damage = null;
         if (count == 1) count = null;
 
-        return new Item(id, identifier, damage, count, tag);
+        String blockNBT = null;
+        if (data.getBlockRuntimeId() != 0) {
+            blockNBT = encodeNbtToString(paletteTags.get(data.getBlockRuntimeId()));
+        }
+
+        return new Item(id, identifier, damage, count, tag, blockNBT);
+    }
+
+    private static String encodeNbtToString(NbtMap tag) {
+        ByteArrayOutputStream byteArrayOutputStream = new ByteArrayOutputStream();
+        try (NBTOutputStream stream = new NBTOutputStream(new LittleEndianDataOutputStream(byteArrayOutputStream))) {
+            stream.writeTag(tag);
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+        return Base64.getEncoder().encodeToString(byteArrayOutputStream.toByteArray());
     }
 
     @NoArgsConstructor
@@ -201,13 +229,14 @@ public class RecipeUtils {
     @Value
     @JsonInclude(JsonInclude.Include.NON_NULL)
     private static class Item {
-        public static final Item EMPTY = new Item(0, "minecraft:air", null, null, null);
+        public static final Item EMPTY = new Item(0, "minecraft:air", null, null, null, null);
 
         int legacyId;
         String id;
         Integer damage;
         Integer count;
         String nbt_b64;
+        String block_state_b64;
     }
 
     @Value
